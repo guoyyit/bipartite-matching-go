@@ -11,6 +11,7 @@ import (
 
 	bipartite "github.com/guoyyit/bipartite-matching-go"
 	"github.com/guoyyit/bipartite-matching-go/matching"
+	storepkg "github.com/guoyyit/bipartite-matching-go/store"
 )
 
 type server struct {
@@ -49,9 +50,10 @@ type queryResp struct {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
 	dataDir := flag.String("data", "./.bimatch-data", "local state directory")
+	history := flag.Int("history", 128, "number of committed versions kept readable (0 = unlimited)")
 	flag.Parse()
 
-	svc, err := bipartite.Open(*dataDir, matching.NewGraph())
+	svc, err := bipartite.Open(*dataDir, matching.NewGraph(), storepkg.WithHistory(*history))
 	if err != nil {
 		log.Fatalf("open service: %v", err)
 	}
@@ -257,10 +259,20 @@ func (s *server) match(w http.ResponseWriter, r *http.Request) {
 
 func writeError(w http.ResponseWriter, err error) {
 	if errors.Is(err, bipartite.ErrUnknownVersion) {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeErrorCode(w, http.StatusNotFound, "version_not_found", err)
+		return
+	}
+	if errors.Is(err, bipartite.ErrConflict) {
+		writeErrorCode(w, http.StatusConflict, "conflict", err)
 		return
 	}
 	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+func writeErrorCode(w http.ResponseWriter, status int, code string, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error(), "error_code": code})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

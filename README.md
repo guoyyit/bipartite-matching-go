@@ -69,9 +69,33 @@ has a valid answer).
 - Edges/constraints are changed inside a transaction (`BeginUpdate` …
   `Commit`/`Rollback`). A transaction works on a private deep copy, so
   uncommitted changes are invisible to every query.
-- Commits are serialized. Each commit solves all three scopes incrementally
-  from the previous committed flow, persists the new version, and only then
-  publishes an immutable snapshot to readers.
+- A transaction is explicitly based on the committed version captured by
+  `BeginUpdate`. Commits are serialized by a single commit mutex. When the
+  base version is no longer the latest, the staged operations are merged
+  onto the newest committed state instead of blindly overwriting it.
+- The merge is bit-for-bit identical to running the transactions serially in
+  commit order:
+  - changes to distinct edges or distinct constraints all survive;
+  - two commits writing the same edge or the same constraint (weight,
+    forbidden flag, vertex cap) take the later committer's value;
+  - every successful commit is fully present in the final state — no
+    committed update is ever silently lost.
+- A commit is rejected only when its operations cannot be replayed over the
+  newer state: it adds an edge a concurrent commit already added, deletes or
+  modifies an edge a concurrent commit deleted, or removes a forbidden flag
+  already removed concurrently. Such a commit returns the distinct,
+  retryable sentinel `bipartite.ErrConflict` (`errors.Is`); the HTTP API
+  answers `409` with `error_code: "conflict"`. Nothing is persisted or
+  published on conflict: no version number is consumed, no partial state is
+  visible, and version numbers/on-disk content never gain holes.
+- A rejected or rolled-back transaction is dead: recommitting it or staging
+  more changes returns `bipartite.ErrTxnRolledBack`. The caller retries by
+  beginning a fresh transaction from the latest version, reapplying its
+  intent and committing that (see `TestConflictRejectedAndRetrySucceeds`).
+- Each accepted commit solves all three scopes incrementally from the
+  previous committed flow, fully persists the new version first, and only
+  then publishes an immutable snapshot to readers; crash recovery ends in
+  exactly the state visible before the crash.
 - Incremental results are bit-for-bit identical to a from-scratch
   recomputation (verified exhaustively in the tests by comparing the warm
   solver against a cold solve after thousands of random changes).
@@ -88,6 +112,28 @@ query targets either the latest version (`version=0`) or an explicit
 historical version. A response always reflects one complete version — graph
 edges and matching result can never be mixed across versions. Reads are
 lock-free against updates (atomic pointer to an immutable snapshot).
+
+### History retention and restarts
+
+The readable window is exactly the newest `history` committed versions; the
+default is 128 and `0` means unlimited. The value is configured at open time
+(`store.WithHistory(retain)`, or the server flag `-history`) and persisted in
+`<data-dir>/meta.json`, so it applies identically after every restart;
+reopening a directory without the option keeps the stored value. Shrinking
+the window takes effect immediately on the next open.
+
+- Every version readable before a restart stays readable after it with the
+  same graph and bit-for-bit identical results for all three solve scopes.
+  The retention rule itself does not change because of a restart.
+- A version outside the retained window — pruned or never assigned — returns
+  the distinct sentinel `bipartite.ErrUnknownVersion` (`errors.Is`); the HTTP
+  API answers `404` with `error_code: "version_not_found"`.
+- After a restart the warm solver replays retained history, so further
+  commits stay incremental and remain bit-for-bit identical to from-scratch
+  recomputation.
+- Directories produced by older builds (only `wal.log`, no `meta.json`) open
+  directly with no manual migration; all history their WAL contains is
+  recovered and the meta file is created lazily.
 
 ## Persistence and crash recovery
 
@@ -106,8 +152,10 @@ Each committed version is appended as a length-framed JSON record to
 
 ## Concurrency
 
-- Multiple writers are serialized through a single commit mutex; the result
-  is equivalent to some serial order and no committed update is lost.
+- Multiple writers are serialized through a single commit mutex and merged
+  with the commit-order serial semantics above. Unmergeable commits fail
+  explicitly with a retryable conflict instead of overwriting committed
+  changes.
 - Readers never hold the writer lock; they observe immutable snapshots and are
   not blocked for long by an in-progress update.
 
@@ -116,7 +164,7 @@ Each committed version is appended as a length-framed JSON record to
 Run the local server:
 
 ```sh
-go run ./cmd/bimatch -addr 127.0.0.1:8080 -data ./.bimatch-data
+go run ./cmd/bimatch -addr 127.0.0.1:8080 -data ./.bimatch-data -history 128
 ```
 
 Endpoints (all mutations are `POST` JSON and commit immediately):
@@ -130,8 +178,12 @@ Endpoints (all mutations are `POST` JSON and commit immediately):
 - `POST /constraints/cap` — `{ "vertex","side":"left|right","cap" }`.
 - `GET /match?scope=max_weight|max_cardinality|perfect&version=0`.
 
-An infeasible scope returns HTTP `409` with `error_code` set. A pruned or
-unknown version returns HTTP `404`.
+An infeasible scope returns HTTP `409` with its `error_code`; a stale commit
+that failed to merge returns HTTP `409` with `error_code: "conflict"` and is
+safe to retry inside a brand-new transaction. A pruned or unknown version
+returns HTTP `404` with `error_code: "version_not_found"`. Go clients
+distinguish outcomes with `errors.Is(err, bipartite.ErrConflict)` and
+`errors.Is(err, bipartite.ErrUnknownVersion)`.
 
 Example:
 
@@ -158,11 +210,24 @@ curl 'localhost:8080/match?scope=perfect'
   changes for every scope.
 - `matching/perf_test.go` — incremental single-change cost beats full solve.
 - `store/store_test.go` — persistence across reopen, torn-tail recovery.
+- `store/options_test.go`, `store/compat_test.go` — configurable durable
+  history retention (including unlimited), and direct recovery of directories
+  written by older builds with no migration.
 - `service_test.go` — query semantics, transaction isolation, versioned
   reads, constraint failure codes, crash recovery, concurrent readers/writers.
+- `service_concurrency_test.go` — overlapping transactions on distinct and
+  shared edges/constraints, last-committer-wins bit-for-bit equivalence,
+  distinct conflict rejection, retry on a fresh transaction, rejected/rolled
+  back transaction non-reuse, rollback/commit interleaving, and a concurrent
+  stress test (run repeatedly with `go test -race -count=N`).
+- `service_history_test.go` — bit-for-bit graph/solution comparison for every
+  retained version before and after restart, post-restart incremental
+  consistency across a second restart, retention-window configuration,
+  shrinking, unlimited history, and legacy directory recovery.
 
 Run them with:
 
 ```sh
 go test ./...
+go test -race -count=10 -run TestConcurrent ./...
 ```

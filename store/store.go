@@ -15,6 +15,7 @@ import (
 
 const (
 	walFileName    = "wal.log"
+	metaFileName   = "meta.json"
 	tmpSuffix      = ".tmp"
 	defaultHistory = 128
 )
@@ -167,18 +168,103 @@ type Store struct {
 	wal     *os.File
 	records []VersionRecord
 	latest  int64
+	history int // number of versions retained; 0 means unlimited
+}
+
+// Option configures a Store at open time.
+type Option func(*config)
+
+type config struct {
+	history int
+}
+
+// WithHistory sets how many committed versions remain readable. retain must
+// be at least 1; 0 means unlimited history. The value is persisted alongside
+// the WAL and applies identically after every restart.
+func WithHistory(retain int) Option {
+	return func(c *config) { c.history = retain }
+}
+
+// meta is the small on-disk configuration record for a store directory.
+type meta struct {
+	History int `json:"history"`
 }
 
 // Open opens (or creates) a store in dir and replays any committed history.
-func Open(dir string) (*Store, error) {
+func Open(dir string, opts ...Option) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create store dir: %w", err)
 	}
-	s := &Store{dir: dir, latest: -1}
+	cfg := config{history: defaultHistory}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.history < 0 {
+		return nil, errors.New("history retention must be non-negative")
+	}
+	s := &Store{dir: dir, latest: -1, history: cfg.history}
+	if err := s.loadOrSaveMeta(cfg.history); err != nil {
+		return nil, err
+	}
 	if err := s.recover(); err != nil {
 		return nil, err
 	}
+	// Apply the configured retention immediately: shrinking the window must
+	// take effect even before the next commit, identically before and after
+	// restart.
+	s.mu.Lock()
+	s.maybeCompactLocked()
+	s.mu.Unlock()
 	return s, nil
+}
+
+// History returns the configured number of retained versions (0 = unlimited).
+func (s *Store) History() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.history
+}
+
+// loadOrSaveMeta makes the retention configuration durable and identical
+// across restarts. Directories created by older builds have no meta file:
+// they open unchanged with the built-in default and only write meta lazily.
+func (s *Store) loadOrSaveMeta(requested int) error {
+	path := filepath.Join(s.dir, metaFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("read store meta: %w", err)
+		}
+		return s.saveMeta(requested)
+	}
+	var stored meta
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return fmt.Errorf("decode store meta: %w", err)
+	}
+	if stored.History < 0 {
+		return errors.New("stored history retention must be non-negative")
+	}
+	s.history = stored.History
+	if requested != defaultHistory && requested != stored.History {
+		s.history = requested
+		return s.saveMeta(requested)
+	}
+	return nil
+}
+
+func (s *Store) saveMeta(retain int) error {
+	tmpPath := filepath.Join(s.dir, metaFileName+tmpSuffix)
+	data, err := json.Marshal(meta{History: retain})
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return fmt.Errorf("write store meta: %w", err)
+	}
+	if err := os.Rename(tmpPath, filepath.Join(s.dir, metaFileName)); err != nil {
+		return fmt.Errorf("install store meta: %w", err)
+	}
+	return nil
 }
 
 // Append atomically persists one committed version and makes it visible.
@@ -209,11 +295,21 @@ func (s *Store) Append(rec VersionRecord) error {
 
 	s.records = append(s.records, rec)
 	s.latest = rec.Version
-	if len(s.records) > 2*defaultHistory {
-		// Compaction is best-effort and never blocks the commit path.
-		_ = s.compactLocked(defaultHistory)
-	}
+	s.maybeCompactLocked()
 	return nil
+}
+
+// maybeCompactLocked prunes everything older than the configured retention so
+// the readable window is always exactly the newest history versions (or all
+// versions when history is 0). Compaction is best-effort: if the rewrite
+// fails the commit is already durable and the next Append retries pruning.
+// Because a successful compaction rewrites both the in-memory records and the
+// on-disk WAL together, the readable window is identical after a restart.
+func (s *Store) maybeCompactLocked() {
+	if s.history == 0 || len(s.records) <= s.history {
+		return
+	}
+	_ = s.compactLocked(s.history)
 }
 
 // Latest returns the newest committed version.
@@ -224,6 +320,17 @@ func (s *Store) Latest() VersionRecord {
 		return VersionRecord{Version: -1}
 	}
 	return s.records[len(s.records)-1]
+}
+
+// Oldest returns the version number of the oldest still-retained record and
+// false when the store has no committed history.
+func (s *Store) Oldest() (int64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.records) == 0 {
+		return 0, false
+	}
+	return s.records[0].Version, true
 }
 
 // At returns a committed historical version.

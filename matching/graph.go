@@ -108,6 +108,7 @@ type Change struct {
 	Pair   Pair
 	Weight int64
 	Cap    int
+	Vertex string
 }
 
 // Match is one selected edge in a solved matching.
