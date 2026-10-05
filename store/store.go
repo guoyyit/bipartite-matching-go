@@ -167,14 +167,26 @@ type Store struct {
 	wal     *os.File
 	records []VersionRecord
 	latest  int64
+	history int
 }
 
 // Open opens (or creates) a store in dir and replays any committed history.
 func Open(dir string) (*Store, error) {
+	return OpenWithHistoryLimit(dir, 0)
+}
+
+// OpenWithHistoryLimit opens a store that retains between historyLimit and
+// 2*historyLimit committed versions (compaction is lazy). A non-positive
+// limit selects the default. The same limit must be supplied across restarts
+// for the retained window to stay identical.
+func OpenWithHistoryLimit(dir string, historyLimit int) (*Store, error) {
+	if historyLimit <= 0 {
+		historyLimit = defaultHistory
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create store dir: %w", err)
 	}
-	s := &Store{dir: dir, latest: -1}
+	s := &Store{dir: dir, latest: -1, history: historyLimit}
 	if err := s.recover(); err != nil {
 		return nil, err
 	}
@@ -209,9 +221,9 @@ func (s *Store) Append(rec VersionRecord) error {
 
 	s.records = append(s.records, rec)
 	s.latest = rec.Version
-	if len(s.records) > 2*defaultHistory {
+	if len(s.records) > 2*s.history {
 		// Compaction is best-effort and never blocks the commit path.
-		_ = s.compactLocked(defaultHistory)
+		_ = s.compactLocked(s.history)
 	}
 	return nil
 }
@@ -238,6 +250,23 @@ func (s *Store) At(version int64) (VersionRecord, bool) {
 		return VersionRecord{}, false
 	}
 	return s.records[version-base], true
+}
+
+// Base returns the oldest retained version and whether any version exists.
+func (s *Store) Base() (int64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.records) == 0 {
+		return 0, false
+	}
+	return s.records[0].Version, true
+}
+
+// Records returns every retained committed version, oldest first.
+func (s *Store) Records() []VersionRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]VersionRecord(nil), s.records...)
 }
 
 // Close flushes and releases the store.

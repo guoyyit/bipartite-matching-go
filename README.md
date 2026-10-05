@@ -72,6 +72,20 @@ has a valid answer).
 - Commits are serialized. Each commit solves all three scopes incrementally
   from the previous committed flow, persists the new version, and only then
   publishes an immutable snapshot to readers.
+- Overlapping transactions never lose committed changes. Every mutation is
+  journaled; if other transactions committed after a transaction began, its
+  journal is replayed onto the latest committed state at commit time. A
+  successful commit is therefore always equivalent to applying the
+  transaction's operations in commit (serial) order — when two transactions
+  touch the same edge or constraint, the later committer's value wins,
+  bit-for-bit identical to serial execution.
+- When a stale transaction cannot be replayed safely (e.g. it re-adds an
+  edge another commit already added, or reweights an edge another commit
+  deleted), the commit is rejected with `ErrTxnConflict` — a distinguishable
+  (`errors.Is`), retryable error. Nothing is published and no version number
+  is consumed. The rejected transaction can never commit afterwards; the
+  caller opens a fresh transaction on the latest version and re-applies the
+  intended changes (staging-time validation then reflects the new state).
 - Incremental results are bit-for-bit identical to a from-scratch
   recomputation (verified exhaustively in the tests by comparing the warm
   solver against a cold solve after thousands of random changes).
@@ -89,6 +103,17 @@ historical version. A response always reflects one complete version — graph
 edges and matching result can never be mixed across versions. Reads are
 lock-free against updates (atomic pointer to an immutable snapshot).
 
+### History retention
+
+The service retains a bounded window of committed versions for historical
+reads: between `N` and `2N` recent versions, with `N` defaulting to 128 and
+configurable via `OpenWithHistoryLimit` (or `-history` on the server). The
+window is a deterministic function of the commit sequence and the limit, so
+the readable range is identical before and after a restart — any version
+readable before shutdown is readable after reopening, and pruned versions
+always report `ErrUnknownVersion` (HTTP `404`). Use the same limit across
+restarts to keep the window stable.
+
 ## Persistence and crash recovery
 
 Each committed version is appended as a length-framed JSON record to
@@ -99,24 +124,30 @@ Each committed version is appended as a length-framed JSON record to
   fully committed versions survive.
 - An uncommitted transaction holds no on-disk state, so a crash cannot leave a
   partially applied update.
-- After replay the warm-solver state is rebuilt from committed versions so
-  post-restart updates remain incremental.
+- All retained versions are restored for historical reads, and the
+  warm-solver state is rebuilt through them, so post-restart updates remain
+  incremental and bit-for-bit equal to cold recomputation.
 - The WAL is compacted periodically by writing a temp file, fsyncing it, and
   atomically renaming it over the live log, so compaction cannot lose commits.
+- Data directories written by older versions open directly; no manual
+  migration is needed.
 
 ## Concurrency
 
-- Multiple writers are serialized through a single commit mutex; the result
-  is equivalent to some serial order and no committed update is lost.
+- Multiple writers are serialized through a single commit mutex. Overlapping
+  transactions are merged by journal replay (see above) or rejected with
+  `ErrTxnConflict`; a commit that returns success never loses its changes
+  and the final state equals the serial application of all successful
+  commits in commit order.
 - Readers never hold the writer lock; they observe immutable snapshots and are
   not blocked for long by an in-progress update.
 
 ## HTTP usage
 
-Run the local server:
+Run the local server (`-history` sets the retained-version window):
 
 ```sh
-go run ./cmd/bimatch -addr 127.0.0.1:8080 -data ./.bimatch-data
+go run ./cmd/bimatch -addr 127.0.0.1:8080 -data ./.bimatch-data -history 128
 ```
 
 Endpoints (all mutations are `POST` JSON and commit immediately):
@@ -130,8 +161,10 @@ Endpoints (all mutations are `POST` JSON and commit immediately):
 - `POST /constraints/cap` — `{ "vertex","side":"left|right","cap" }`.
 - `GET /match?scope=max_weight|max_cardinality|perfect&version=0`.
 
-An infeasible scope returns HTTP `409` with `error_code` set. A pruned or
-unknown version returns HTTP `404`.
+An infeasible scope returns HTTP `409` with `error_code` set. A commit that
+conflicts with concurrently committed state also returns HTTP `409` (retry
+by re-applying the change on the latest state). A pruned or unknown version
+returns HTTP `404`.
 
 Example:
 
@@ -158,11 +191,18 @@ curl 'localhost:8080/match?scope=perfect'
   changes for every scope.
 - `matching/perf_test.go` — incremental single-change cost beats full solve.
 - `store/store_test.go` — persistence across reopen, torn-tail recovery.
+  `store/prune_test.go` — retention window, configurable history limit.
 - `service_test.go` — query semantics, transaction isolation, versioned
   reads, constraint failure codes, crash recovery, concurrent readers/writers.
+- `service_conflict_test.go` — overlapping transactions on different/same
+  data, conflict rejection and retry, rejected-transaction reuse, rollback
+  interleaving, concurrent commit pressure (run with `-race`).
+- `service_history_test.go` — bit-for-bit history comparison across
+  restarts, retention-window consistency, post-restart incremental
+  correctness, legacy data-directory compatibility.
 
 Run them with:
 
 ```sh
-go test ./...
+go test -race ./...
 ```

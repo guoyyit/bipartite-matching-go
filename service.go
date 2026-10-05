@@ -2,6 +2,7 @@ package bipartite
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -14,6 +15,14 @@ var ErrTxnRolledBack = errors.New("transaction rolled back")
 
 // ErrUnknownVersion is returned for snapshot reads outside retained history.
 var ErrUnknownVersion = errors.New("unknown or pruned version")
+
+// ErrTxnConflict rejects a commit whose transaction was based on a stale
+// version and whose changes cannot be replayed cleanly onto the latest
+// committed state (for example it re-adds an edge another commit already
+// added, or reweights an edge another commit deleted). It is distinguishable
+// via errors.Is and retryable: open a fresh transaction on the latest
+// version and re-apply the changes. A rejected transaction never commits.
+var ErrTxnConflict = errors.New("transaction conflicts with committed state")
 
 // snapshot is one immutable committed version shared by all readers.
 type snapshot struct {
@@ -36,17 +45,28 @@ type Service struct {
 
 // Txn stages uncommitted graph changes privately.
 type Txn struct {
-	service *Service
-	staged  *matching.Graph
-	closed  bool
+	service    *Service
+	base       int64
+	staged     *matching.Graph
+	ops        []matching.Change
+	closed     bool
+	conflicted bool
 }
 
 // Open creates or recovers a service backed by dir.
 func Open(dir string, g *matching.Graph) (*Service, error) {
+	return OpenWithHistoryLimit(dir, g, 0)
+}
+
+// OpenWithHistoryLimit opens a service that retains between historyLimit and
+// 2*historyLimit committed versions for historical reads (a non-positive
+// limit selects the default). The limit applies identically before and after
+// a restart: the readable window always matches the records retained on disk.
+func OpenWithHistoryLimit(dir string, g *matching.Graph, historyLimit int) (*Service, error) {
 	if g == nil {
 		g = matching.NewGraph()
 	}
-	storage, err := store.Open(dir)
+	storage, err := store.OpenWithHistoryLimit(dir, historyLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -60,28 +80,26 @@ func Open(dir string, g *matching.Graph) (*Service, error) {
 		},
 	}
 
-	latest := storage.Latest()
-	if latest.Version >= 0 {
-		snap := &snapshot{
-			version:   latest.Version,
-			graph:     latest.Graph,
-			solutions: latest.Solutions,
-			errors:    latest.Errors,
-		}
-		s.head.Store(snap)
-		s.versions[snap.version] = snap
-		s.nextVer = snap.version + 1
-		// Rebuild warm-solver state through committed history so the next
+	records := storage.Records()
+	if len(records) > 0 {
+		// Every retained committed version stays readable after a restart,
+		// and warm-solver state is rebuilt through them so the next
 		// incremental update does not start cold.
-		for version := int64(1); version <= snap.version; version++ {
-			rec, ok := storage.At(version)
-			if !ok {
-				continue
+		for _, rec := range records {
+			snap := &snapshot{
+				version:   rec.Version,
+				graph:     rec.Graph,
+				solutions: rec.Solutions,
+				errors:    rec.Errors,
 			}
+			s.versions[rec.Version] = snap
 			for _, scope := range scopes() {
 				_, _ = s.warm[scope].Apply(rec.Graph)
 			}
 		}
+		latest := records[len(records)-1]
+		s.head.Store(s.versions[latest.Version])
+		s.nextVer = latest.Version + 1
 	} else {
 		if err := s.publishInitial(g); err != nil {
 			return nil, err
@@ -93,16 +111,28 @@ func Open(dir string, g *matching.Graph) (*Service, error) {
 // BeginUpdate starts a private update transaction based on the latest commit.
 func (s *Service) BeginUpdate() *Txn {
 	base := s.head.Load()
-	return &Txn{service: s, staged: base.graph.Clone()}
+	return &Txn{service: s, base: base.version, staged: base.graph.Clone()}
 }
 
-// Commit validates and atomically publishes the staged changes.
+// Commit validates and atomically publishes the staged changes. When other
+// transactions committed after this one began, the staged operations are
+// replayed onto the latest committed state; the result is then exactly the
+// serial application of this transaction after those commits. If any
+// operation no longer applies, the commit is rejected with ErrTxnConflict
+// and the transaction cannot be committed again.
 func (t *Txn) Commit() (int64, error) {
 	if t.closed {
+		if t.conflicted {
+			return 0, ErrTxnConflict
+		}
 		return 0, ErrTxnRolledBack
 	}
 	t.closed = true
-	return t.service.commit(t.staged)
+	version, err := t.service.commit(t)
+	if err != nil && errors.Is(err, ErrTxnConflict) {
+		t.conflicted = true
+	}
+	return version, err
 }
 
 // Rollback discards all staged changes.
@@ -166,93 +196,108 @@ func (s *Service) Close() error {
 
 // AddEdge stages a new edge; duplicate pairs are rejected before commit.
 func (t *Txn) AddEdge(pair matching.Pair, weight int64) error {
-	if t.closed {
-		return ErrTxnRolledBack
-	}
-	if _, exists := t.staged.Edges[pair]; exists {
-		return errors.New("edge already exists: " + pair.Left + "/" + pair.Right)
-	}
-	t.ensureVertex(pair.Left, true)
-	t.ensureVertex(pair.Right, false)
-	t.staged.Edges[pair] = weight
-	return nil
+	change := matching.Change{Kind: matching.ChangeAddEdge, Pair: pair, Weight: weight}
+	return t.stage(change)
 }
 
 // DeleteEdge stages removal of an edge.
 func (t *Txn) DeleteEdge(pair matching.Pair) error {
-	if t.closed {
-		return ErrTxnRolledBack
-	}
-	if _, exists := t.staged.Edges[pair]; !exists {
-		return errors.New("edge does not exist: " + pair.Left + "/" + pair.Right)
-	}
-	delete(t.staged.Edges, pair)
-	return nil
+	return t.stage(matching.Change{Kind: matching.ChangeDeleteEdge, Pair: pair})
 }
 
 // SetWeight stages an in-place weight modification.
 func (t *Txn) SetWeight(pair matching.Pair, weight int64) error {
-	if t.closed {
-		return ErrTxnRolledBack
-	}
-	if _, exists := t.staged.Edges[pair]; !exists {
-		return errors.New("edge does not exist: " + pair.Left + "/" + pair.Right)
-	}
-	t.staged.Edges[pair] = weight
-	return nil
+	return t.stage(matching.Change{Kind: matching.ChangeSetWeight, Pair: pair, Weight: weight})
 }
 
 // Forbid stages a forbidden-pair constraint.
 func (t *Txn) Forbid(pair matching.Pair) error {
-	if t.closed {
-		return ErrTxnRolledBack
-	}
-	t.staged.Forbidden[pair] = struct{}{}
-	return nil
+	return t.stage(matching.Change{Kind: matching.ChangeForbid, Pair: pair})
 }
 
 // Allow stages removal of a forbidden-pair constraint.
 func (t *Txn) Allow(pair matching.Pair) error {
-	if t.closed {
-		return ErrTxnRolledBack
-	}
-	if _, banned := t.staged.Forbidden[pair]; !banned {
-		return errors.New("pair is not forbidden: " + pair.Left + "/" + pair.Right)
-	}
-	delete(t.staged.Forbidden, pair)
-	return nil
+	return t.stage(matching.Change{Kind: matching.ChangeAllow, Pair: pair})
 }
 
 // SetLeftCap stages a per-left-vertex match-count cap.
 func (t *Txn) SetLeftCap(vertex string, cap int) error {
-	return t.setCap(vertex, cap, true)
+	return t.stage(matching.Change{Kind: matching.ChangeSetLeftCap, Pair: matching.Pair{Left: vertex}, Cap: cap})
 }
 
 // SetRightCap stages a per-right-vertex match-count cap.
 func (t *Txn) SetRightCap(vertex string, cap int) error {
-	return t.setCap(vertex, cap, false)
+	return t.stage(matching.Change{Kind: matching.ChangeSetRightCap, Pair: matching.Pair{Right: vertex}, Cap: cap})
 }
 
-func (t *Txn) setCap(vertex string, cap int, left bool) error {
+// stage validates one change against the private staged graph and records it
+// in the transaction journal for a potential replay at commit time.
+func (t *Txn) stage(change matching.Change) error {
 	if t.closed {
 		return ErrTxnRolledBack
 	}
-	if cap < 0 {
-		return errors.New("match cap must be non-negative")
+	if err := applyChange(t.staged, change); err != nil {
+		return err
 	}
-	t.ensureVertex(vertex, left)
-	if left {
-		t.staged.LeftCap[vertex] = cap
-	} else {
-		t.staged.RightCap[vertex] = cap
+	t.ops = append(t.ops, change)
+	return nil
+}
+
+// applyChange applies one journaled change to g with the same validation the
+// staging path uses. It is shared by staging and by commit-time replay, so a
+// replayed transaction observes exactly the serial application of its ops.
+func applyChange(g *matching.Graph, change matching.Change) error {
+	pair := change.Pair
+	switch change.Kind {
+	case matching.ChangeAddEdge:
+		if _, exists := g.Edges[pair]; exists {
+			return errors.New("edge already exists: " + pair.Left + "/" + pair.Right)
+		}
+		ensureVertex(g, pair.Left, true)
+		ensureVertex(g, pair.Right, false)
+		g.Edges[pair] = change.Weight
+	case matching.ChangeDeleteEdge:
+		if _, exists := g.Edges[pair]; !exists {
+			return errors.New("edge does not exist: " + pair.Left + "/" + pair.Right)
+		}
+		delete(g.Edges, pair)
+	case matching.ChangeSetWeight:
+		if _, exists := g.Edges[pair]; !exists {
+			return errors.New("edge does not exist: " + pair.Left + "/" + pair.Right)
+		}
+		g.Edges[pair] = change.Weight
+	case matching.ChangeForbid:
+		g.Forbidden[pair] = struct{}{}
+	case matching.ChangeAllow:
+		if _, banned := g.Forbidden[pair]; !banned {
+			return errors.New("pair is not forbidden: " + pair.Left + "/" + pair.Right)
+		}
+		delete(g.Forbidden, pair)
+	case matching.ChangeSetLeftCap, matching.ChangeSetRightCap:
+		if change.Cap < 0 {
+			return errors.New("match cap must be non-negative")
+		}
+		left := change.Kind == matching.ChangeSetLeftCap
+		vertex := pair.Right
+		if left {
+			vertex = pair.Left
+		}
+		ensureVertex(g, vertex, left)
+		if left {
+			g.LeftCap[vertex] = change.Cap
+		} else {
+			g.RightCap[vertex] = change.Cap
+		}
+	default:
+		return errors.New("unknown change kind")
 	}
 	return nil
 }
 
-func (t *Txn) ensureVertex(vertex string, left bool) {
-	list := t.staged.Right
+func ensureVertex(g *matching.Graph, vertex string, left bool) {
+	list := g.Right
 	if left {
-		list = t.staged.Left
+		list = g.Left
 	}
 	for _, existing := range list {
 		if existing == vertex {
@@ -260,9 +305,9 @@ func (t *Txn) ensureVertex(vertex string, left bool) {
 		}
 	}
 	if left {
-		t.staged.Left = append(t.staged.Left, vertex)
+		g.Left = append(g.Left, vertex)
 	} else {
-		t.staged.Right = append(t.staged.Right, vertex)
+		g.Right = append(g.Right, vertex)
 	}
 }
 
@@ -282,26 +327,63 @@ func (s *Service) publishInitial(g *matching.Graph) error {
 	return nil
 }
 
-// commit serializes all updates: solves incrementally, persists first and
-// only then publishes the new immutable snapshot to readers.
-func (s *Service) commit(g *matching.Graph) (int64, error) {
+// commit serializes all updates: it merges the transaction onto the latest
+// committed state, solves incrementally, persists first and only then
+// publishes the new immutable snapshot to readers. A transaction based on a
+// stale version is rejected with ErrTxnConflict when its journal cannot be
+// replayed cleanly; a rejected commit assigns no version and publishes
+// nothing.
+func (s *Service) commit(t *Txn) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	solutions, solveErrors := solveAll(s.warm, g)
+	head := s.head.Load()
+	graph := t.staged
+	if t.base != head.version {
+		// The base is stale: replay the journal onto the latest committed
+		// state. Success is exactly the serial application of this
+		// transaction after the intervening commits; any operation that no
+		// longer applies rejects the commit with a retryable conflict.
+		graph = head.graph.Clone()
+		for _, op := range t.ops {
+			if err := applyChange(graph, op); err != nil {
+				return 0, fmt.Errorf("%w: %v", ErrTxnConflict, err)
+			}
+		}
+	}
+
+	solutions, solveErrors := solveAll(s.warm, graph)
 	version := s.nextVer
 	rec := store.VersionRecord{
 		Version:   version,
+		Changes:   append([]matching.Change(nil), t.ops...),
 		Solutions: solutions,
 		Errors:    solveErrors,
-		Graph:     g.Clone(),
+		Graph:     graph.Clone(),
 	}
 	if err := s.storage.Append(rec); err != nil {
 		return 0, err
 	}
-	s.install(&snapshot{version: version, graph: g.Clone(), solutions: solutions, errors: solveErrors})
+	s.install(&snapshot{version: version, graph: graph, solutions: solutions, errors: solveErrors})
 	s.nextVer++
+	s.pruneVersions()
 	return version, nil
+}
+
+// pruneVersions drops in-memory snapshots the store has compacted away, so
+// the readable history window is identical before and after a restart.
+func (s *Service) pruneVersions() {
+	base, ok := s.storage.Base()
+	if !ok {
+		return
+	}
+	s.verMu.Lock()
+	defer s.verMu.Unlock()
+	for version := range s.versions {
+		if version < base {
+			delete(s.versions, version)
+		}
+	}
 }
 
 func solveAll(warm map[matching.Scope]*matching.WarmSolver, g *matching.Graph) (map[matching.Scope]*matching.Solution, map[matching.Scope]matching.FailureCode) {

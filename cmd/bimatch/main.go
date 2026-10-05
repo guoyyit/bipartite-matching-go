@@ -49,9 +49,10 @@ type queryResp struct {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
 	dataDir := flag.String("data", "./.bimatch-data", "local state directory")
+	history := flag.Int("history", 0, "committed versions retained for historical reads (0 = default 128)")
 	flag.Parse()
 
-	svc, err := bipartite.Open(*dataDir, matching.NewGraph())
+	svc, err := bipartite.OpenWithHistoryLimit(*dataDir, matching.NewGraph(), *history)
 	if err != nil {
 		log.Fatalf("open service: %v", err)
 	}
@@ -256,6 +257,10 @@ func (s *server) match(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, bipartite.ErrTxnConflict) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
 	if errors.Is(err, bipartite.ErrUnknownVersion) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return

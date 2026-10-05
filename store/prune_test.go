@@ -38,3 +38,47 @@ func TestVersionPruning(t *testing.T) {
 		t.Fatalf("read latest version = %d", latestRec.Version)
 	}
 }
+
+func TestConfigurableHistoryLimit(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenWithHistoryLimit(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The 9th append pushes retained records past 2*4 and compacts to 4.
+	for v := int64(0); v < 9; v++ {
+		if err := s.Append(sampleRecord(v, v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base, ok := s.Base()
+	if !ok || base != 5 {
+		t.Fatalf("base = %d/%v, want 5/true", base, ok)
+	}
+	if _, ok := s.At(4); ok {
+		t.Fatal("version 4 should have been compacted away")
+	}
+	if got := len(s.Records()); got != 4 {
+		t.Fatalf("retained records = %d, want 4", got)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopening with the same limit must expose the identical window.
+	s2, err := OpenWithHistoryLimit(dir, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	base, ok = s2.Base()
+	if !ok || base != 5 {
+		t.Fatalf("base after reopen = %d/%v, want 5/true", base, ok)
+	}
+	if _, ok := s2.At(4); ok {
+		t.Fatal("version 4 must stay pruned after reopen")
+	}
+	if _, ok := s2.At(8); !ok {
+		t.Fatal("version 8 must be readable after reopen")
+	}
+}
